@@ -1,19 +1,16 @@
 name: Deploy Returns Dashboard to GCP
 
-# Keeps the latest code deployed on GCP Cloud Run: on every push to main we
-# build the Docker image, push it to Artifact Registry, run any pending
-# Prisma migrations against Cloud SQL (Postgres), then deploy the new
-# revision. Also runs on a schedule to hit the auto-approve endpoint as a
-# belt-and-braces SLA sweep even if the app is idle.
-
 on:
   push:
-    branches: [main]
+    branches:
+      - main
 
-  schedule:
-    - cron: "*/15 * * * *" # SLA sweep every 15 minutes
+  workflow_dispatch:
 
-  workflow_dispatch: {}
+# Prevent duplicate deployments from running simultaneously.
+concurrency:
+  group: returns-dashboard-deploy
+  cancel-in-progress: false
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
@@ -23,75 +20,65 @@ env:
 
 jobs:
   deploy:
-    if: github.event_name != 'schedule'
-
+    name: Build and Deploy to Cloud Run
     runs-on: ubuntu-latest
 
-    # Required for GitHub OIDC authentication
     permissions:
       contents: read
       id-token: write
 
     steps:
-      # Checkout repository
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Authenticate GitHub Actions with Google Cloud using Workload Identity Federation
+      # 2. Authenticate using Workload Identity Federation
       - name: Authenticate to Google Cloud
-        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      # Install/configure gcloud
+      # 3. Configure Google Cloud CLI
       - name: Set up Google Cloud CLI
         uses: google-github-actions/setup-gcloud@v2
 
-      # Configure Docker to authenticate with Artifact Registry
-      - name: Configure Docker for Artifact Registry
+      # 4. Authenticate Docker with Artifact Registry
+      - name: Configure Docker
         run: |
           gcloud auth configure-docker \
-            ${{ secrets.GCP_REGION }}-docker.pkg.dev \
+            "${REGION}-docker.pkg.dev" \
             --quiet
 
-      # Build Docker image
-      - name: Build image
+      # 5. Build Docker image
+      - name: Build Docker image
         run: |
           docker build \
-            -t $IMAGE:${{ github.sha }} \
-            -t $IMAGE:latest \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
             .
 
-      # Push Docker image to Artifact Registry
-      - name: Push image
+      # 6. Push Docker image
+      - name: Push Docker image
         run: |
-          docker push $IMAGE --all-tags
+          docker push "${IMAGE}:${GITHUB_SHA}"
 
-      # Run Prisma migrations as a one-off Cloud Run Job instead of `docker run`
-      # on this GitHub-hosted runner. The old approach passed DATABASE_URL via
-      # `docker run -e DATABASE_URL=...`, which puts the raw secret into the
-      # process's argument list (visible to anything on the runner that can
-      # read `ps aux` while the container starts, and into shell/audit logs
-      # on self-hosted runners). Running it as a Cloud Run Job with
-      # `--set-secrets` instead means Google's infrastructure injects the
-      # value straight from Secret Manager into the job's environment —
-      # the plaintext connection string never exists on this runner at all.
-      - name: Run Prisma migrations (Cloud Run Job)
+      # 7. Run Prisma database migrations
+      - name: Run Prisma migrations
         run: |
           gcloud run jobs deploy migrate-db \
-            --image="$IMAGE:${{ github.sha }}" \
-            --region="$REGION" \
+            --image="${IMAGE}:${GITHUB_SHA}" \
+            --region="${REGION}" \
             --command="npx" \
             --args="prisma,migrate,deploy" \
             --set-secrets="DATABASE_URL=${{ secrets.DATABASE_URL_SECRET_NAME }}:latest" \
             --max-retries=0 \
             --quiet
 
-          gcloud run jobs execute migrate-db --region="$REGION" --wait
+          gcloud run jobs execute migrate-db \
+            --region="${REGION}" \
+            --wait
 
-      # Deploy Docker image to Cloud Run
+      # 8. Deploy the application to Cloud Run
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
@@ -99,22 +86,18 @@ jobs:
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE }}:${{ github.sha }}
 
-          env_vars: |
+          env_vars: |-
             AUTH_SECRET=${{ secrets.AUTH_SECRET }}
             CRON_SECRET=${{ secrets.CRON_SECRET }}
 
-          secrets: |
+          secrets: |-
             DATABASE_URL=${{ secrets.DATABASE_URL_SECRET_NAME }}:latest
 
-  # Scheduled SLA sweep
-  sla-sweep:
-    if: github.event_name == 'schedule'
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Hit auto-approve endpoint
+      # 9. Display deployment information
+      - name: Deployment summary
+        if: success()
         run: |
-          curl -sf -X POST \
-            "${{ secrets.APP_URL }}/api/returns/auto-approve" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+          echo "Deployment completed successfully."
+          echo "Service: ${SERVICE_NAME}"
+          echo "Region: ${REGION}"
+          echo "Image: ${IMAGE}:${GITHUB_SHA}"
